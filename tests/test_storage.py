@@ -59,6 +59,46 @@ def test_content_dedup(tmp_path):
     assert r1 == r2  # identical content+name shares one file
 
 
+def test_same_content_different_names_share_physical_file(tmp_path):
+    store = ControlledStorage(tmp_path / "root")
+    digest = "e" * 64
+    r1 = store.store_attachment(b"forwarded bytes", digest, "invoice.pdf")
+    r2 = store.store_attachment(b"forwarded bytes", digest, "fwd_attachment.bin")
+    assert r1 == r2  # shared purely by digest, display name irrelevant
+    files = [p for p in (tmp_path / "root").rglob("*") if p.is_file()]
+    assert len(files) == 1
+    assert files[0].name == f"att-{digest}.bin"
+
+
+def test_verified_download_detects_corruption(tmp_path):
+    import hashlib
+
+    from app.storage import AttachmentIntegrityError, AttachmentMissingError
+
+    store = ControlledStorage(tmp_path / "root")
+    original = b"original contents"
+    digest = hashlib.sha256(original).hexdigest()
+    rel = store.store_attachment(original, digest, "a.bin")
+    path = store.verify_attachment(rel, expected_size=len(original), expected_sha256=digest)
+    assert path.read_bytes() == original
+
+    # Same length, wrong bytes: size matches, only the digest can catch it.
+    tampered = b"originaX contents"
+    assert len(tampered) == len(original)
+    path.write_bytes(tampered)
+    with pytest.raises(AttachmentIntegrityError):
+        store.verify_attachment(rel, expected_size=len(original), expected_sha256=digest)
+
+    # Truncated content: size mismatch is also an explicit integrity failure.
+    path.write_bytes(b"short")
+    with pytest.raises(AttachmentIntegrityError):
+        store.verify_attachment(rel, expected_size=len(original), expected_sha256=digest)
+
+    path.unlink()
+    with pytest.raises(AttachmentMissingError):
+        store.verify_attachment(rel, expected_size=len(original), expected_sha256=digest)
+
+
 def test_attachment_bytes_never_logged(tmp_path, caplog):
     store = ControlledStorage(tmp_path / "root")
     secret = b"SECRET-ATTACHMENT-CONTENT-XYZ"

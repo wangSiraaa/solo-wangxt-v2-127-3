@@ -60,6 +60,14 @@ class StorageError(Exception):
     pass
 
 
+class AttachmentMissingError(StorageError):
+    """The stored relative path resolves inside the root but no file exists."""
+
+
+class AttachmentIntegrityError(StorageError):
+    """The physical file exists but its size/digest no longer matches metadata."""
+
+
 class ControlledStorage:
     """Write files into a root directory using shard subdirectories."""
 
@@ -91,16 +99,17 @@ class ControlledStorage:
         # influence where bytes land on disk. It is kept separately in the DB.
         safe_name = safe_basename(display_name or "")
         prefix = f"{kind}-" if kind else ""
-        if safe_name:
-            file_name = f"{digest}_{safe_name}"
-        else:
-            file_name = f"{prefix}{digest}.bin"
+        # Pure content addressing: identical bytes always resolve to one shared
+        # physical file, even when every mail used a different display name.
+        # Per-message attachment rows (filename, MIME path, access relation)
+        # stay independent in the repository and all point at this relpath.
+        file_name = f"{prefix}{digest}.bin"
         destination = (shard / file_name).resolve()
         self._ensure_inside(destination)
 
         if not destination.exists():
-            # Named file with same content but a different display name: store
-            # under a distinct name so both records resolve correctly.
+            # First write of this digest: any later ingest of identical bytes
+            # reuses the file. O_EXCL makes the shared create race-safe.
             fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, self._file_mode)
             try:
                 with os.fdopen(fd, "wb") as fh:
@@ -145,3 +154,37 @@ class ControlledStorage:
             return self.resolve(relative_path).is_file()
         except StorageError:
             return False
+
+    def verify_attachment(
+        self, relative_path: str, *, expected_size: int, expected_sha256: str
+    ) -> Path:
+        """Return a resolved path only if the file still matches metadata.
+
+        Every download re-validates the DB-held path against the root and
+        verifies size **and** SHA-256 with a bounded streaming read, so a
+        corrupted/truncated/shared physical file fails explicitly instead of
+        serving wrong bytes. Bytes are streamed, never buffered fully and
+        never logged.
+        """
+        path = self.resolve(relative_path)
+        if not path.is_file():
+            raise AttachmentMissingError(f"attachment bytes missing: {relative_path}")
+        h = hashlib.sha256()
+        try:
+            with open(path, "rb") as fh:
+                size = 0
+                while True:
+                    chunk = fh.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    size += len(chunk)
+                    h.update(chunk)
+        except OSError as exc:
+            raise AttachmentMissingError(f"attachment unreadable: {relative_path}") from exc
+        if size != expected_size or h.hexdigest() != expected_sha256:
+            # Metadata only — never include or log payload bytes.
+            raise AttachmentIntegrityError(
+                f"attachment integrity check failed relpath={relative_path} "
+                f"expected_bytes={expected_size} actual_bytes={size}"
+            )
+        return path

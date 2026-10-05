@@ -16,6 +16,7 @@ from app.memory_repository import MemoryRepository
 from app.pg_repository import PgRepository
 from app.repository import Repository
 from app.schemas import (
+    AttachmentCatalogResponse,
     FailureOut,
     Health,
     IngestDetail,
@@ -27,7 +28,12 @@ from app.schemas import (
     ThreadSummary,
 )
 from app.service import IngestService
-from app.storage import ControlledStorage, StorageError
+from app.storage import (
+    AttachmentIntegrityError,
+    AttachmentMissingError,
+    ControlledStorage,
+    StorageError,
+)
 
 log = logging.getLogger("emlarchive.api")
 
@@ -179,28 +185,58 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return thread
 
     # ---- attachments -----------------------------------------------------
+    @app.get("/attachments", response_model=AttachmentCatalogResponse, tags=["attachments"])
+    def attachment_catalog(
+        request: Request,
+        sha256: str | None = Query(None, min_length=1, description="exact SHA-256 digest"),
+        size: int | None = Query(None, ge=0, description="exact byte size"),
+        content_type: str | None = Query(None, min_length=1, description="MIME type or prefix, e.g. image/"),
+        filename: str | None = Query(None, min_length=1, description="exact original display filename"),
+        limit: int = Query(50, ge=1, le=500),
+        offset: int = Query(0, ge=0),
+    ) -> dict[str, Any]:
+        if sha256 is not None:
+            sha256 = sha256.strip().lower()
+            if len(sha256) != 64 or any(c not in "0123456789abcdef" for c in sha256):
+                raise HTTPException(status_code=422, detail="sha256 must be 64 hex characters")
+        return get_state(request).service.query_attachments(
+            sha256=sha256,
+            byte_size=size,
+            content_type=content_type,
+            filename=filename,
+            limit=limit,
+            offset=offset,
+        )
+
     @app.get("/messages/{pk}/attachments/{attachment_id}/download", tags=["attachments"])
     def download_attachment(request: Request, pk: int, attachment_id: int) -> Response:
+        from app.storage import safe_basename
+
         st = get_state(request)
-        att = st.repo.get_attachment(attachment_id)
-        if att is None or att["message_pk"] != pk or not att.get("storage_path"):
-            raise HTTPException(status_code=404, detail="attachment not found")
         try:
-            # resolve() re-validates the stored relative path against the root;
-            # a tampered DB value containing traversal is rejected here.
-            path = st.attachment_storage.resolve(att["storage_path"])
-        except StorageError as exc:
-            log.error(
-                "attachment path rejected id=%d relpath_tampered: %s", attachment_id, exc
+            # Permission/relation check is per message: the attachment id must
+            # belong to this exact message; path re-validation + size/SHA-256
+            # verification happen inside the storage layer.
+            path, att = st.service.open_attachment_download(pk, attachment_id)
+        except LookupError:
+            raise HTTPException(status_code=404, detail="attachment not found")
+        except AttachmentIntegrityError as exc:
+            # Physical file exists but no longer matches its stored digest:
+            # fail explicitly instead of serving wrong bytes. Metadata only.
+            log.error("attachment integrity failure id=%d: %s", attachment_id, exc)
+            raise HTTPException(
+                status_code=409, detail="stored attachment failed integrity verification"
             )
-            raise HTTPException(status_code=400, detail="invalid attachment path")
-        if not path.is_file():
+        except AttachmentMissingError as exc:
+            log.error("attachment missing id=%d: %s", attachment_id, exc)
             raise HTTPException(status_code=410, detail="attachment bytes missing on disk")
+        except StorageError as exc:
+            # Tampered/escaping relative path held in the repository.
+            log.error("attachment path rejected id=%d: %s", attachment_id, exc)
+            raise HTTPException(status_code=400, detail="invalid attachment path")
         # Serve under the *sanitized* basename: raw header names may contain
         # traversal sequences or CRLF header-injection bytes. The original name
         # is still preserved in the database for forensics.
-        from app.storage import safe_basename
-
         safe_name = safe_basename(att.get("filename") or "") or f"attachment-{attachment_id}.bin"
         # FileResponse streams from disk; we never put content into a log line.
         return FileResponse(

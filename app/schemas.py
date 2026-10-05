@@ -83,6 +83,44 @@ class AttachmentOut(BaseModel):
     stored: bool
 
 
+class AttachmentOccurrence(BaseModel):
+    """One message↔attachment relation for a shared content digest."""
+
+    attachment_id: int
+    message_pk: int
+    ingest_id: int
+    message_id: str | None
+    subject: str | None
+    date: datetime | None
+    mime_path: str
+    filename: str | None
+    raw_filename: str | None
+    content_type: str
+    disposition: str
+    content_id: str | None
+    byte_size: int
+    sha256: str
+    stored: bool
+    snippet: str = ""
+    availability: str  # available | missing | invalid_path | unstored
+    download_url: str
+
+
+class AttachmentGroup(BaseModel):
+    sha256: str
+    byte_size: int
+    content_types: list[str]
+    filenames: list[str]
+    occurrences: list[AttachmentOccurrence]
+
+
+class AttachmentCatalogResponse(BaseModel):
+    count: int
+    limit: int
+    offset: int
+    groups: list[AttachmentGroup]
+
+
 class HeaderOut(BaseModel):
     ordinal: int
     name: str

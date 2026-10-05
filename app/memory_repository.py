@@ -9,6 +9,7 @@ from dataclasses import asdict
 from datetime import datetime, timezone
 from typing import Any, Sequence
 
+from app.attachments import make_snippet, shape_catalog
 from app.parser.html_sanitizer import escape_html
 from app.parser.models import ParsedMessage
 from app.threads import ThreadInput, compute_threads
@@ -326,3 +327,76 @@ class MemoryRepository:
             if a["id"] == attachment_id:
                 return dict(a)
         return None
+
+    def get_attachment_by_message(self, message_pk: int, attachment_id: int) -> dict[str, Any] | None:
+        for a in self.attachments:
+            if a["id"] == attachment_id and a["message_pk"] == message_pk:
+                return dict(a)
+        return None
+
+    def _body_snippet(self, message_pk: int) -> str:
+        # Prefer a plain-text part; fall back to text extracted from HTML.
+        text: str | None = None
+        html_plain: str | None = None
+        for b in self.bodies:
+            if b["message_pk"] != message_pk:
+                continue
+            if b["content_type"] == "text/plain" and b.get("text") and text is None:
+                text = b["text"]
+            if b["content_type"] == "text/html" and b.get("plain_text") and html_plain is None:
+                html_plain = b["plain_text"]
+        return make_snippet(text or html_plain)
+
+    def query_attachments(
+        self,
+        *,
+        sha256: str | None,
+        byte_size: int | None,
+        content_type: str | None,
+        filename: str | None,
+        limit: int,
+        offset: int,
+    ) -> dict[str, Any]:
+        ct = content_type.lower() if content_type else None
+        rows: list[dict[str, Any]] = []
+        for a in sorted(self.attachments, key=lambda x: x["id"]):
+            if sha256 is not None and a["checksum_sha256"] != sha256:
+                continue
+            if byte_size is not None and a["byte_size"] != byte_size:
+                continue
+            if ct is not None:
+                have = (a["content_type"] or "").lower()
+                if have != ct and not have.startswith(ct.rstrip("/") + "/"):
+                    continue
+            if filename is not None and a["filename"] != filename:
+                continue
+            m = self.messages.get(a["message_pk"], {})
+            occurrence = {
+                "attachment_id": a["id"],
+                "message_pk": a["message_pk"],
+                "ingest_id": m.get("ingest_id"),
+                "message_id": m.get("message_id"),
+                "subject": m.get("subject"),
+                "date": m.get("date"),
+                "mime_path": a["mime_path"],
+                "filename": a["filename"],
+                "raw_filename": a["raw_filename"],
+                "content_type": a["content_type"],
+                "disposition": a["disposition"],
+                "content_id": a["content_id"],
+                "byte_size": a["byte_size"],
+                "sha256": a["checksum_sha256"],
+                "stored": bool(a.get("stored")),
+                "storage_path": a.get("storage_path"),
+                "snippet": self._body_snippet(a["message_pk"]),
+            }
+            rows.append(
+                {
+                    "sha256": a["checksum_sha256"],
+                    "byte_size": a["byte_size"],
+                    "content_type": a["content_type"],
+                    "filename": a["filename"],
+                    "occurrence": occurrence,
+                }
+            )
+        return shape_catalog(rows, limit=limit, offset=offset)

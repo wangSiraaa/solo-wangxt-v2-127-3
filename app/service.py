@@ -7,7 +7,7 @@ from typing import Any
 
 from app.parser import ParseStatus, parse_eml
 from app.repository import Repository
-from app.storage import ControlledStorage
+from app.storage import AttachmentMissingError, ControlledStorage
 
 log = logging.getLogger("emlarchive.service")
 
@@ -114,3 +114,74 @@ class IngestService:
             attachments=att_summaries,
             threads=threads,
         )
+
+    # -- attachment catalog / downloads ------------------------------------
+    def _availability(self, occurrence: dict[str, Any]) -> str:
+        """Cheap on-disk liveness for catalog rows (metadata only).
+
+        Full size+SHA-256 verification happens at download time; a group whose
+        physical file is damaged still lists, with each occurrence's state
+        reported independently.
+        """
+        rel = occurrence.get("storage_path")
+        if not rel:
+            return "unstored"
+        try:
+            exists = self._att.exists(rel)
+        except StorageError:
+            return "invalid_path"
+        return "available" if exists else "missing"
+
+    def query_attachments(
+        self,
+        *,
+        sha256: str | None = None,
+        byte_size: int | None = None,
+        content_type: str | None = None,
+        filename: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        result = self._repo.query_attachments(
+            sha256=sha256,
+            byte_size=byte_size,
+            content_type=content_type,
+            filename=filename,
+            limit=limit,
+            offset=offset,
+        )
+        for grp in result["groups"]:
+            for occ in grp["occurrences"]:
+                # The physical file may be shared across the group, but the
+                # access relation is per message: each occurrence gets its own
+                # scoped download link and independently reported state.
+                occ["availability"] = self._availability(occ)
+                occ["download_url"] = (
+                    f"/messages/{occ['message_pk']}/attachments/"
+                    f"{occ['attachment_id']}/download"
+                )
+                # Internal routing detail, not part of the catalog contract.
+                occ.pop("storage_path", None)
+        return result
+
+    def open_attachment_download(
+        self, message_pk: int, attachment_id: int
+    ) -> tuple[Any, dict[str, Any]]:
+        """Resolve a scoped attachment download.
+
+        The attachment must belong to this exact message — reusing another
+        message's attachment id never grants access. Raises LookupError when
+        the relation does not exist. The returned path has passed root
+        re-validation and size/SHA-256 verification.
+        """
+        att = self._repo.get_attachment_by_message(message_pk, attachment_id)
+        if att is None:
+            raise LookupError("attachment not found")
+        if not att.get("storage_path"):
+            raise AttachmentMissingError("attachment was never stored")
+        path = self._att.verify_attachment(
+            att["storage_path"],
+            expected_size=att["byte_size"],
+            expected_sha256=att["checksum_sha256"],
+        )
+        return path, att

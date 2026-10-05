@@ -15,6 +15,8 @@ There is **no frontend** — JSON HTTP API only.
 | HTML / scripts / remote resources | HTML is stored only as: sanitized allow-list HTML (`safe_html`), fully escaped HTML (`escaped_html`), and extracted plain text. The stdlib allow-list sanitizer (`app/parser/html_sanitizer.py`) removes `<script>`, `<style>`, `<iframe>`, event handlers, `style=`/`class=`/`data=`, and **every** loading URL except inline `cid:` resources. Remote `http(s)`, protocol-relative, `data:`, `vbscript:` and `javascript:` loaders are stripped. |
 | Inline resources | `multipart/related` / `Content-ID` parts are parsed as binary attachments with `content_id`; HTML parts record `referenced_cids` — links are facts, nothing is fetched. |
 | Attachment bytes in logs | Only metadata is logged (content type, size, sha256, relative path). A test asserts payload markers never appear in log records. |
+| Attachment content reuse | Physical files are **purely content-addressed** (`<shard>/att-<sha256>.bin`): the same attachment forwarded in several mails shares one on-disk file. The per-message attachment relations (filename, MIME path, download permission) stay independent rows. |
+| Attachment download | Each download is scoped to its owning message, re-validates the stored path against the root, and streams a size + **SHA-256 verification** before serving; a corrupt shared file fails every relation with `409`, a missing file with `410`, a tampered/escaping path with `400`. |
 | Upload size | Hard streaming cap (`EMLARCH_MAX_UPLOAD_BYTES`) before persistence. |
 | SQL | psycopg3 parameterized statements throughout; no string-built DML. |
 | File modes | Stored files default to `0600`. |
@@ -33,6 +35,33 @@ There is **no frontend** — JSON HTTP API only.
   an ingest row with the raw digest and defects.
 * **Provenance**: each ingest stores the raw EML sha256, size, on-disk path
   and the parsed result references the same digest.
+
+## Attachment catalog / content reuse
+
+The same attachment is often forwarded several times. Rather than merging
+those mails, attachments are identified **by content**:
+
+* Physical storage is purely content-addressed
+  (`<shard>/att-<sha256>.bin`): identical bytes — under any filenames — share
+  one file. Every per-message attachment row (display name, raw encoded name,
+  MIME path, content id) is still stored independently and points at that
+  shared relpath.
+* `GET /attachments?sha256=…&size=…&content_type=image/&filename=…` (all
+  filters optional, AND-combined) returns **digest groups**. A group reports
+  the shared size, every distinct content type/filename seen for those bytes,
+  and one `occurrences` entry per message: message PK/Message-ID, subject,
+  MIME path, original filename, a bounded snippet of the source body
+  (`snippet`, 原文摘要), liveness (`available` / `missing` / `invalid_path` /
+  `unstored`) and that message's own scoped `download_url`.
+* Grouping is on SHA-256 only: same content + different filenames aggregate
+  yet remain separately traceable; same filename + different content never
+  merges.
+* Even when a stored path is damaged, the catalog still returns the row's
+  metadata; the download then fails explicitly (`409` digest/size mismatch,
+  `410` missing bytes, `400` escaping path). Cross-message attachment ids are
+  rejected (`404`) — the relation check is per message.
+* The in-memory and PostgreSQL backends share the same shaping code
+  (`app/attachments.py`); catalog/download tests run against both.
 
 ## Threading / conversations
 
@@ -55,7 +84,8 @@ Implemented in `app/threads.py` (pure function, unit tested):
 |---|---|---|
 | POST | `/ingest` | multipart upload of one `.eml`; returns status, digest, parts, attachments, threading report |
 | GET | `/messages` / `/messages/{id}` | list / full detail (tree, bodies, attachments, defects) |
-| GET | `/messages/{id}/attachments/{aid}/download` | stream attachment bytes (path re-validated) |
+| GET | `/messages/{id}/attachments/{aid}/download` | stream attachment bytes (message-scoped, path re-validated, digest verified) |
+| GET | `/attachments` | attachment catalog: filter by `sha256`, `size`, `content_type` (type/prefix), `filename`; results grouped by digest with every owning message |
 | GET | `/search?q=` | substring over subject, Message-ID, all header values, body plain text |
 | GET | `/threads` / `/threads/{key}` | thread summaries / ordered members with reference headers |
 | POST | `/threads/rebuild` | recompute all threads; returns conflicts/cycles/dangling/weak hints |
@@ -91,9 +121,10 @@ ls samples/
 ### Tests
 
 ```bash
-.venv/bin/python -m pytest                       # 47 unit + API tests (memory backend)
+.venv/bin/python -m pytest                       # unit + API tests (memory backend)
 EMLARCH_RUN_PG_TESTS=1 EMLARCH_TEST_DSN='postgresql://postgres@/postgres?host=/tmp/pgsock&port=55432' \
   .venv/bin/python -m pytest                     # + real PostgreSQL integration tests
+                                                 # (catalog/download cases run on both backends)
 ```
 
 ### Quick manual check
@@ -108,6 +139,7 @@ curl "http://127.0.0.1:8080/search?q=GB18030"
 ```
 app/
   config.py            env-driven configuration (roots, cap, DSN)
+  attachments.py       content-addressed catalog shaping (shared by backends)
   parser/
     eml_parser.py      stdlib email parsing, structural walk, charset ladder
     html_sanitizer.py  allow-list sanitizer + escaping + text extraction

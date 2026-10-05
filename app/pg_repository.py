@@ -9,6 +9,7 @@ from typing import Any, Sequence
 import psycopg
 from psycopg.types.json import Jsonb
 
+from app.attachments import make_snippet, shape_catalog
 from app.parser.html_sanitizer import escape_html
 from app.parser.models import ParsedMessage
 from app.threads import ThreadInput, compute_threads
@@ -373,6 +374,102 @@ class PgRepository:
                 return None
             cols = [c.name for c in cur.description]
             return _jsonify(dict(zip(cols, row)))
+
+    def get_attachment_by_message(self, message_pk: int, attachment_id: int) -> dict[str, Any] | None:
+        with self.connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM attachments WHERE id = %s AND message_pk = %s",
+                (attachment_id, message_pk),
+            )
+            row = cur.fetchone()
+            if not row:
+                return None
+            cols = [c.name for c in cur.description]
+            return _jsonify(dict(zip(cols, row)))
+
+    def query_attachments(
+        self,
+        *,
+        sha256: str | None,
+        byte_size: int | None,
+        content_type: str | None,
+        filename: str | None,
+        limit: int,
+        offset: int,
+    ) -> dict[str, Any]:
+        where: list[str] = []
+        params: list[Any] = []
+        if sha256 is not None:
+            where.append("a.checksum_sha256 = %s")
+            params.append(sha256)
+        if byte_size is not None:
+            where.append("a.byte_size = %s")
+            params.append(byte_size)
+        if content_type is not None:
+            ct = content_type.lower()
+            where.append("(LOWER(a.content_type) = %s OR LOWER(a.content_type) LIKE %s)")
+            params.extend([ct, ct.rstrip("/") + "/%"])
+        if filename is not None:
+            where.append("a.filename = %s")
+            params.append(filename)
+        where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+
+        sql = f"""
+            SELECT a.id, a.message_pk, m.ingest_id, m.message_id, m.subject, m.date,
+                   a.mime_path, a.filename, a.raw_filename, a.content_type,
+                   a.disposition, a.content_id, a.byte_size, a.checksum_sha256,
+                   a.stored, a.storage_path, snip.pt AS snippet
+            FROM attachments a
+            JOIN messages m ON m.id = a.message_pk
+            LEFT JOIN LATERAL (
+                SELECT plain_text AS pt
+                FROM bodies b
+                WHERE b.message_pk = a.message_pk
+                ORDER BY CASE WHEN b.content_type = 'text/plain' THEN 0 ELSE 1 END, b.id
+                LIMIT 1
+            ) snip ON TRUE
+            {where_sql}
+            ORDER BY a.id ASC
+        """
+        with self.connect() as conn, conn.cursor() as cur:
+            cur.execute(sql, params)
+            raw = cur.fetchall()
+
+        rows: list[dict[str, Any]] = []
+        for (
+            att_id, message_pk, ingest_id, message_id, subject, dt,
+            mime_path, fname, raw_fname, ctype, disposition, cid,
+            size, digest, stored, storage_path, snippet,
+        ) in raw:
+            occurrence = {
+                "attachment_id": att_id,
+                "message_pk": message_pk,
+                "ingest_id": ingest_id,
+                "message_id": message_id,
+                "subject": subject,
+                "date": dt,
+                "mime_path": mime_path,
+                "filename": fname,
+                "raw_filename": raw_fname,
+                "content_type": ctype,
+                "disposition": disposition,
+                "content_id": cid,
+                "byte_size": size,
+                "sha256": digest,
+                "stored": bool(stored),
+                "storage_path": storage_path,
+                "snippet": make_snippet(snippet),
+            }
+            rows.append(
+                {
+                    "sha256": digest,
+                    "byte_size": size,
+                    "content_type": ctype,
+                    "filename": fname,
+                    "occurrence": occurrence,
+                }
+            )
+        return shape_catalog(rows, limit=limit, offset=offset)
 
 
 def _jsonify(value: Any) -> Any:

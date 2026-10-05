@@ -44,3 +44,22 @@ class Repository(Protocol):
     def list_failures(self, limit: int, offset: int) -> list[dict[str, Any]]: ...
     def get_attachment(self, attachment_id: int) -> dict[str, Any] | None: ...
     def get_attachment_by_message(self, message_pk: int, attachment_id: int) -> dict[str, Any] | None: ...
+    def query_attachments(
+        self,
+        *,
+        sha256: str | None,
+        byte_size: int | None,
+        content_type: str | None,
+        filename: str | None,
+        limit: int,
+        offset: int,
+    ) -> dict[str, Any]:
+        """Content-addressed attachment catalog (digest-grouped occurrences).
+
+        Filters are optional and AND-combined; ``filename`` is an exact match
+        on the display name recorded for that specific occurrence and
+        ``content_type`` is a type/prefix match. Returns digest groups with
+        every owning message (id, message-id, subject, MIME path, original
+        filename, body snippet). Metadata only — never attachment bytes.
+        """
+        ...

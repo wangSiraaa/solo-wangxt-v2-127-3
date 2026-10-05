@@ -96,7 +96,11 @@ CREATE TABLE IF NOT EXISTS attachments (
     stored          BOOLEAN NOT NULL DEFAULT FALSE
 );
 CREATE INDEX IF NOT EXISTS idx_attach_message ON attachments(message_pk);
+-- Content-addressed catalog lookups (digest groups, size/type/name filters).
 CREATE INDEX IF NOT EXISTS idx_attach_sha ON attachments(checksum_sha256);
+CREATE INDEX IF NOT EXISTS idx_attach_size ON attachments(byte_size);
+CREATE INDEX IF NOT EXISTS idx_attach_ctype ON attachments(content_type);
+CREATE INDEX IF NOT EXISTS idx_attach_filename ON attachments(filename);
 
 CREATE TABLE IF NOT EXISTS defects (
     id              BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
