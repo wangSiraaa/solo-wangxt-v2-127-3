@@ -56,7 +56,9 @@ def test_content_dedup(tmp_path):
     store = ControlledStorage(tmp_path / "root")
     r1 = store.store_attachment(b"same", "c" * 64, "one.txt")
     r2 = store.store_attachment(b"same", "c" * 64, "one.txt")
-    assert r1 == r2  # identical content+name shares one file
+    assert r1 == r2  # identical content shares one file
+    r3 = store.store_attachment(b"same", "c" * 64, "different-name.txt")
+    assert r3 == r1  # the sender's filename is not part of physical identity
 
 
 def test_attachment_bytes_never_logged(tmp_path, caplog):

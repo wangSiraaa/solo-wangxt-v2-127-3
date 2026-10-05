@@ -4,10 +4,11 @@ Security guarantees:
 * Everything is written **under** a configured root that is resolved once at
   construction. Callers can only influence a generated shard/file name, never
   an absolute path.
-* Filenames are reduced to a safe basename: separators, NUL bytes, drive
-  letters and traversal sequences cannot escape the shard directory
-  (:func:`safe_basename`). As defense in depth, every final path is checked
-  with :func:`pathlib.Path.relative_to` after resolution.
+* Filenames are reduced to a safe basename for logging and download responses
+  (:func:`safe_basename`); they never influence the physical path. Attachment
+  bytes are stored at one canonical, SHA-256 content-addressed path so the same
+  payload forwarded in separate mails shares a physical file while each
+  message/attachment relationship remains independent in the catalog.
 * Attachment **bytes are never logged**. Log lines contain only metadata
   (content type, size, checksum, stored relative path).
 """
@@ -28,9 +29,9 @@ _MAX_NAME_LEN = 128
 def safe_basename(name: str) -> str:
     """Reduce a possibly hostile attachment name to one safe file component.
 
-    ``"../../etc/passwd"`` -> ``"etc_passwd"``; absolute Windows/UNC names and
+    ``"../../etc/passwd"`` -> ``"passwd"``; absolute Windows/UNC names and
     NUL bytes are neutralized. The result never contains a separator, so it
-    cannot address a parent directory.
+    cannot address a parent directory when used in a download header.
     """
     if not name:
         return ""
@@ -87,20 +88,14 @@ class ControlledStorage:
 
     def _write(self, data: bytes, digest: str, display_name: str | None, kind: str) -> str:
         shard = self._shard_dir(digest)
-        # Content-addressed base name: a name chosen by the sender cannot
-        # influence where bytes land on disk. It is kept separately in the DB.
-        safe_name = safe_basename(display_name or "")
-        prefix = f"{kind}-" if kind else ""
-        if safe_name:
-            file_name = f"{digest}_{safe_name}"
-        else:
-            file_name = f"{prefix}{digest}.bin"
+        # Content-addressed file name: identical payloads share one physical
+        # file even when separate messages call them by different display names.
+        # The sender-supplied name remains metadata and is not part of this path.
+        file_name = f"{kind}-{digest}.bin" if kind == "raw" else f"{digest}.bin"
         destination = (shard / file_name).resolve()
         self._ensure_inside(destination)
 
         if not destination.exists():
-            # Named file with same content but a different display name: store
-            # under a distinct name so both records resolve correctly.
             fd = os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, self._file_mode)
             try:
                 with os.fdopen(fd, "wb") as fh:
@@ -116,7 +111,7 @@ class ControlledStorage:
         log.info(
             "stored %s: name=%r content_type_ignored_here bytes=%d sha256=%s relpath=%s",
             kind,
-            safe_name or None,
+            safe_basename(display_name or "") or None,
             len(data),
             digest,
             destination.relative_to(self.root),
@@ -125,6 +120,11 @@ class ControlledStorage:
 
     # -- public API --------------------------------------------------------
     def store_attachment(self, data: bytes, checksum_sha256: str, filename: str | None) -> str:
+        if not re.fullmatch(r"[0-9a-f]{64}", checksum_sha256):
+            raise StorageError("invalid attachment SHA-256 digest")
+        actual = hashlib.sha256(data).hexdigest()
+        if actual != checksum_sha256:
+            raise StorageError("attachment checksum mismatch")
         return self._write(data, checksum_sha256, filename, kind="att")
 
     def store_raw(self, data: bytes) -> tuple[str, str]:

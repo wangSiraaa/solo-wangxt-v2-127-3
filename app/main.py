@@ -16,6 +16,7 @@ from app.memory_repository import MemoryRepository
 from app.pg_repository import PgRepository
 from app.repository import Repository
 from app.schemas import (
+    AttachmentCatalogResponse,
     FailureOut,
     Health,
     IngestDetail,
@@ -179,11 +180,32 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return thread
 
     # ---- attachments -----------------------------------------------------
+    @app.get("/attachments", response_model=AttachmentCatalogResponse, tags=["attachments"])
+    def find_attachments(
+        request: Request,
+        sha256: str | None = Query(
+            None, min_length=64, max_length=64, pattern=r"^[0-9a-fA-F]{64}$"
+        ),
+        size: int | None = Query(None, ge=0),
+        type: str | None = Query(None, min_length=1),
+        filename: str | None = Query(None, min_length=1),
+        limit: int = Query(50, ge=1, le=500),
+        offset: int = Query(0, ge=0),
+    ) -> dict[str, Any]:
+        return get_state(request).repo.find_attachments(
+            sha256=sha256.lower() if sha256 else None,
+            byte_size=size,
+            content_type=type,
+            filename=filename,
+            limit=limit,
+            offset=offset,
+        )
+
     @app.get("/messages/{pk}/attachments/{attachment_id}/download", tags=["attachments"])
     def download_attachment(request: Request, pk: int, attachment_id: int) -> Response:
         st = get_state(request)
-        att = st.repo.get_attachment(attachment_id)
-        if att is None or att["message_pk"] != pk or not att.get("storage_path"):
+        att = st.repo.get_attachment_by_message(pk, attachment_id)
+        if att is None or not att.get("storage_path"):
             raise HTTPException(status_code=404, detail="attachment not found")
         try:
             # resolve() re-validates the stored relative path against the root;

@@ -6,6 +6,7 @@ equivalent (JSONB aggregates, LATERAL identifier rollups, ILIKE joins).
 """
 import pytest
 
+from attachment_catalog_cases import assert_attachment_catalog_behavior
 from conftest import SAMPLES
 
 pytestmark = pytest.mark.pg
@@ -96,3 +97,8 @@ def test_idempotent_schema_init(pg_client):
     # creating a second repository over the same DSN must not error on DDL
     arch.repo.init_schema()
     assert c.get("/health").status_code == 200
+
+
+def test_attachment_catalog_matches_memory(pg_client):
+    c, arch = pg_client
+    assert_attachment_catalog_behavior(c, arch)

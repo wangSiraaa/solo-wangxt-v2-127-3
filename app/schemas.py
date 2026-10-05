@@ -83,6 +83,52 @@ class AttachmentOut(BaseModel):
     stored: bool
 
 
+class AttachmentCatalogOccurrence(BaseModel):
+    attachment_id: int
+    message_pk: int
+    message_id: str | None
+    subject: str | None
+    date: datetime | None
+    from_json: list[dict[str, Any]]
+    mime_path: str
+    filename: str | None
+    raw_filename: str | None
+    content_type: str
+    byte_size: int
+    checksum_sha256: str
+    storage_path: str | None
+    stored: bool
+    source_snippet: str | None = None
+
+
+class AttachmentCatalogGroup(BaseModel):
+    checksum_sha256: str
+    byte_size: int
+    shared_storage_paths: list[str] = Field(default_factory=list)
+    stored: bool
+    occurrence_count: int
+    occurrences: list[AttachmentCatalogOccurrence]
+
+
+class AttachmentCatalogFilters(BaseModel):
+    sha256: str | None = None
+    size: int | None = Field(
+        default=None, validation_alias="byte_size", serialization_alias="size"
+    )
+    type: str | None = Field(
+        default=None, validation_alias="content_type", serialization_alias="type"
+    )
+    filename: str | None = None
+
+    model_config = {"populate_by_name": True}
+
+
+class AttachmentCatalogResponse(BaseModel):
+    filters: AttachmentCatalogFilters
+    count: int
+    groups: list[AttachmentCatalogGroup]
+
+
 class HeaderOut(BaseModel):
     ordinal: int
     name: str

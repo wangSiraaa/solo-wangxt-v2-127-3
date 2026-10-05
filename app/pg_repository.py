@@ -9,6 +9,7 @@ from typing import Any, Sequence
 import psycopg
 from psycopg.types.json import Jsonb
 
+from app.catalog import build_attachment_catalog
 from app.parser.html_sanitizer import escape_html
 from app.parser.models import ParsedMessage
 from app.threads import ThreadInput, compute_threads
@@ -147,6 +148,7 @@ class PgRepository:
 
                 for att in parsed.attachments:
                     rel = att.storage_path
+                    was_stored = id(att) in stored_by_path
                     cur.execute(
                         """
                         INSERT INTO attachments (message_pk, mime_path, content_type, charset,
@@ -167,7 +169,7 @@ class PgRepository:
                             att.byte_size,
                             att.checksum_sha256,
                             rel,
-                            rel is not None,
+                            was_stored,
                         ),
                     )
 
@@ -365,9 +367,125 @@ class PgRepository:
             cols = [c.name for c in cur.description]
             return _jsonify([dict(zip(cols, r)) for r in cur.fetchall()])
 
+    def find_attachments(
+        self,
+        *,
+        sha256: str | None = None,
+        byte_size: int | None = None,
+        content_type: str | None = None,
+        filename: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if sha256 is not None:
+            clauses.append("a.checksum_sha256 = %s")
+            params.append(sha256)
+        if byte_size is not None:
+            clauses.append("a.byte_size = %s")
+            params.append(byte_size)
+        if content_type is not None:
+            clauses.append("lower(a.content_type) = lower(%s)")
+            params.append(content_type)
+        if filename is not None:
+            clauses.append("lower(a.filename) = lower(%s)")
+            params.append(filename)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        # Reuse the same WHERE clause only for SELECT lists that expose `a`;
+        # all dynamic fragments are fixed repository SQL with bound parameters.
+        with self.connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                f"""
+                SELECT count(*) FROM (
+                    SELECT 1 FROM attachments a
+                    {where}
+                    GROUP BY a.checksum_sha256
+                ) catalog_groups
+                """,
+                params,
+            )
+            count = cur.fetchone()[0]
+
+            cur.execute(
+                f"""
+                SELECT a.checksum_sha256
+                FROM attachments a
+                {where}
+                GROUP BY a.checksum_sha256
+                ORDER BY a.checksum_sha256
+                LIMIT %s OFFSET %s
+                """,
+                [*params, limit, offset],
+            )
+            digests = [row[0] for row in cur.fetchall()]
+            if not digests:
+                occurrences: list[dict[str, Any]] = []
+            else:
+                cur.execute(
+                    """
+                    SELECT a.id AS attachment_id,
+                           a.message_pk,
+                           m.message_id,
+                           m.subject,
+                           m.date,
+                           m.from_json,
+                           a.mime_path,
+                           a.filename,
+                           a.raw_filename,
+                           a.content_type,
+                           a.byte_size,
+                           a.checksum_sha256,
+                           a.storage_path,
+                           a.stored,
+                           LEFT(NULLIF((
+                               SELECT LEFT(btrim(regexp_replace(b.plain_text, E'\\s+', ' ', 'g')), 200)
+                               FROM bodies b
+                               WHERE b.message_pk = m.id
+                                 AND BTRIM(b.plain_text) <> ''
+                               ORDER BY CASE WHEN b.content_type = 'text/plain' THEN 0 ELSE 1 END,
+                                        b.id
+                               LIMIT 1
+                           ), ''), 200) AS source_snippet
+                    FROM attachments a
+                    JOIN messages m ON m.id = a.message_pk
+                    WHERE a.checksum_sha256 = ANY(%s)
+                    ORDER BY a.checksum_sha256, a.message_pk, a.id
+                    """,
+                    (digests,),
+                )
+                cols = [c.name for c in cur.description]
+                occurrences = [dict(zip(cols, row)) for row in cur.fetchall()]
+
+        groups = build_attachment_catalog(_jsonify(occurrences))
+        return {
+            "filters": {
+                "sha256": sha256,
+                "size": byte_size,
+                "type": content_type,
+                "filename": filename,
+            },
+            "count": count,
+            "groups": groups,
+        }
+
     def get_attachment(self, attachment_id: int) -> dict[str, Any] | None:
         with self.connect() as conn, conn.cursor() as cur:
             cur.execute("SELECT * FROM attachments WHERE id = %s", (attachment_id,))
+            row = cur.fetchone()
+            if not row:
+                return None
+            cols = [c.name for c in cur.description]
+            return _jsonify(dict(zip(cols, row)))
+
+    def get_attachment_by_message(
+        self, message_pk: int, attachment_id: int
+    ) -> dict[str, Any] | None:
+        with self.connect() as conn, conn.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM attachments WHERE id = %s AND message_pk = %s",
+                (attachment_id, message_pk),
+            )
             row = cur.fetchone()
             if not row:
                 return None

@@ -97,6 +97,8 @@ CREATE TABLE IF NOT EXISTS attachments (
 );
 CREATE INDEX IF NOT EXISTS idx_attach_message ON attachments(message_pk);
 CREATE INDEX IF NOT EXISTS idx_attach_sha ON attachments(checksum_sha256);
+CREATE INDEX IF NOT EXISTS idx_attach_type_size ON attachments(content_type, byte_size);
+CREATE INDEX IF NOT EXISTS idx_attach_filename ON attachments(filename);
 
 CREATE TABLE IF NOT EXISTS defects (
     id              BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,

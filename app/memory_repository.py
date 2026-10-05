@@ -9,6 +9,7 @@ from dataclasses import asdict
 from datetime import datetime, timezone
 from typing import Any, Sequence
 
+from app.catalog import body_snippet, build_attachment_catalog
 from app.parser.html_sanitizer import escape_html
 from app.parser.models import ParsedMessage
 from app.threads import ThreadInput, compute_threads
@@ -59,6 +60,7 @@ class MemoryRepository:
             "defect_count": len(parsed.defects),
         }
         message_pk: int | None = None
+        stored_attachment_ids = {id(att) for att, _ in stored_attachments}
         if status != "failed":
             self._msg_seq += 1
             message_pk = self._msg_seq
@@ -139,7 +141,7 @@ class MemoryRepository:
                         "byte_size": att.byte_size,
                         "checksum_sha256": att.checksum_sha256,
                         "storage_path": att.storage_path,
-                        "stored": att.storage_path is not None,
+                        "stored": id(att) in stored_attachment_ids,
                     }
                 )
         self.defects.extend(
@@ -321,8 +323,76 @@ class MemoryRepository:
         rows.sort(key=lambda x: x["ingest_id"], reverse=True)
         return rows[offset : offset + limit]
 
+    def find_attachments(
+        self,
+        *,
+        sha256: str | None = None,
+        byte_size: int | None = None,
+        content_type: str | None = None,
+        filename: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        wanted_filename = filename.casefold() if filename is not None else None
+        wanted_type = content_type.casefold() if content_type is not None else None
+
+        matched: list[dict[str, Any]] = []
+        for att in self.attachments:
+            if sha256 is not None and att["checksum_sha256"] != sha256:
+                continue
+            if byte_size is not None and att["byte_size"] != byte_size:
+                continue
+            if wanted_type is not None and att["content_type"].casefold() != wanted_type:
+                continue
+            if wanted_filename is not None and (att["filename"] or "").casefold() != wanted_filename:
+                continue
+
+            message = self.messages.get(att["message_pk"])
+            if message is None:
+                continue
+            bodies = [b for b in self.bodies if b["message_pk"] == att["message_pk"]]
+            matched.append(
+                {
+                    "attachment_id": att["id"],
+                    "message_pk": att["message_pk"],
+                    "message_id": message["message_id"],
+                    "subject": message["subject"],
+                    "date": message["date"],
+                    "from_json": message["from_json"],
+                    "mime_path": att["mime_path"],
+                    "filename": att["filename"],
+                    "raw_filename": att["raw_filename"],
+                    "content_type": att["content_type"],
+                    "byte_size": att["byte_size"],
+                    "checksum_sha256": att["checksum_sha256"],
+                    "storage_path": att["storage_path"],
+                    "stored": att["stored"],
+                    "source_snippet": body_snippet(bodies),
+                }
+            )
+
+        groups = build_attachment_catalog(matched)
+        return {
+            "filters": {
+                "sha256": sha256,
+                "size": byte_size,
+                "type": content_type,
+                "filename": filename,
+            },
+            "count": len(groups),
+            "groups": groups[offset : offset + limit],
+        }
+
     def get_attachment(self, attachment_id: int) -> dict[str, Any] | None:
         for a in self.attachments:
             if a["id"] == attachment_id:
+                return dict(a)
+        return None
+
+    def get_attachment_by_message(
+        self, message_pk: int, attachment_id: int
+    ) -> dict[str, Any] | None:
+        for a in self.attachments:
+            if a["id"] == attachment_id and a["message_pk"] == message_pk:
                 return dict(a)
         return None

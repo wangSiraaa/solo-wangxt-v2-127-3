@@ -11,7 +11,7 @@ There is **no frontend** — JSON HTTP API only.
 
 | Concern | How it is handled |
 |---|---|
-| Attachment path escape | Storage root is resolved once; sender-supplied names are reduced to one safe basename (`app/storage.py::safe_basename`) and bytes are written to **content-addressed** shard names. Every path is re-validated with `Path.relative_to(root)`. Downloads re-validate the stored path and serve a sanitized `Content-Disposition` filename. |
+| Attachment path escape | Storage root is resolved once; bytes are written to canonical SHA-256 content-addressed shard names. Identical attachment payloads from separate mails share one physical file, while each message keeps an independent attachment row. Every path is re-validated with `Path.relative_to(root)`. Downloads are scoped to the message/attachment pair, re-validate the stored path and serve a sanitized `Content-Disposition` filename. |
 | HTML / scripts / remote resources | HTML is stored only as: sanitized allow-list HTML (`safe_html`), fully escaped HTML (`escaped_html`), and extracted plain text. The stdlib allow-list sanitizer (`app/parser/html_sanitizer.py`) removes `<script>`, `<style>`, `<iframe>`, event handlers, `style=`/`class=`/`data=`, and **every** loading URL except inline `cid:` resources. Remote `http(s)`, protocol-relative, `data:`, `vbscript:` and `javascript:` loaders are stripped. |
 | Inline resources | `multipart/related` / `Content-ID` parts are parsed as binary attachments with `content_id`; HTML parts record `referenced_cids` — links are facts, nothing is fetched. |
 | Attachment bytes in logs | Only metadata is logged (content type, size, sha256, relative path). A test asserts payload markers never appear in log records. |
@@ -55,7 +55,8 @@ Implemented in `app/threads.py` (pure function, unit tested):
 |---|---|---|
 | POST | `/ingest` | multipart upload of one `.eml`; returns status, digest, parts, attachments, threading report |
 | GET | `/messages` / `/messages/{id}` | list / full detail (tree, bodies, attachments, defects) |
-| GET | `/messages/{id}/attachments/{aid}/download` | stream attachment bytes (path re-validated) |
+| GET | `/messages/{id}/attachments/{aid}/download` | stream attachment bytes (per-message path re-validation) |
+| GET | `/attachments?sha256=&size=&type=&filename=` | content-addressed attachment catalog; groups equal digests, returns each mail/MIME path/name/source snippet without merging messages |
 | GET | `/search?q=` | substring over subject, Message-ID, all header values, body plain text |
 | GET | `/threads` / `/threads/{key}` | thread summaries / ordered members with reference headers |
 | POST | `/threads/rebuild` | recompute all threads; returns conflicts/cycles/dangling/weak hints |
